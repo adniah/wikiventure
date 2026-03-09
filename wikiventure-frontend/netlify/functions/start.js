@@ -5,10 +5,6 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: 'Method Not Allowed' };
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return { statusCode: 500, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'ANTHROPIC_API_KEY is not set in Netlify environment variables' }) };
-  }
-
   try {
     const { title } = JSON.parse(event.body);
 
