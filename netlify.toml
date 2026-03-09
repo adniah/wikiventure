@@ -1,6 +1,6 @@
 [build]
   publish = "wikiventure-frontend/dist"
-  command = "cd wikiventure-frontend && npm run build"
+  command = "cd wikiventure-frontend && npm install && npm run build"
 
 [functions]
   directory = "wikiventure-frontend/netlify/functions"
