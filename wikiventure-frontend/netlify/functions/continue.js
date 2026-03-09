@@ -35,7 +35,7 @@ NOTE: If this choice leads to a natural conclusion of the story, you can end it 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1500,
       messages: messages
     });
