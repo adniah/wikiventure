@@ -55,7 +55,7 @@ NOTE: When the story reaches a natural conclusion, you can end it by including "
     console.error(error);
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'Failed to generate story' })
+      body: JSON.stringify({ error: 'Failed to generate story', status: error.status, message: error.message || String(error) })
     };
   }
 };
