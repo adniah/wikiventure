@@ -8,7 +8,11 @@
       "Bash(netstat:*)",
       "Bash(taskkill:*)",
       "Bash(npm start:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "WebFetch(domain:wikiventure.netlify.app)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:app.netlify.com)"
     ]
   }
 }
