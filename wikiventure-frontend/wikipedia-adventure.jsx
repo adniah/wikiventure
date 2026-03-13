@@ -1,7 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Sparkles, ExternalLink, RefreshCw, BookOpen } from 'lucide-react';
+import { createClient } from '@supabase/supabase-js';
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '';
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
 
 export default function WikipediaAdventure() {
   const [gameState, setGameState] = useState('input'); // 'input', 'loading', 'playing', 'saves', 'achievements'
@@ -19,6 +24,40 @@ export default function WikipediaAdventure() {
   const [achievements, setAchievements] = useState([]);
   const [showAchievement, setShowAchievement] = useState(null);
   const storyRef = useRef(null);
+
+  // Auth & subscription state
+  const [user, setUser] = useState(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [userTier, setUserTier] = useState('free');
+  const [dailyUsage, setDailyUsage] = useState({ stories_started: 0, total_turns: 0 });
+  const [storyMaxTurns, setStoryMaxTurns] = useState(null);
+  const [storyCurrentTurn, setStoryCurrentTurn] = useState(0);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authMode, setAuthMode] = useState('login');
+  const [authError, setAuthError] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
+  // Auth session listener
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setSessionLoading(false);
+      if (session?.user) {
+        fetchUserData(session.access_token);
+        // If returning from Stripe checkout, clean the URL
+        if (window.location.search.includes('upgraded=true')) {
+          window.history.replaceState({}, '', window.location.pathname);
+        }
+      }
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      if (session?.user) fetchUserData(session.access_token);
+      else { setUserTier('free'); setDailyUsage({ stories_started: 0, total_turns: 0 }); }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
   // Load saves and achievements on mount
   useEffect(() => {
@@ -222,8 +261,96 @@ export default function WikipediaAdventure() {
     }
   };
 
+  // Fetch usage data from backend
+  const fetchUserData = async (token) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/get-user-data`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUserTier(data.tier || 'free');
+        setDailyUsage(data.usage || { stories_started: 0, total_turns: 0 });
+      }
+    } catch (err) {
+      console.error('Failed to fetch user data:', err);
+    }
+  };
+
+  // Handle login / signup
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    setAuthSubmitting(true);
+    setAuthError('');
+    try {
+      const fn = authMode === 'login'
+        ? supabase.auth.signInWithPassword({ email: authEmail, password: authPassword })
+        : supabase.auth.signUp({ email: authEmail, password: authPassword });
+      const { error } = await fn;
+      if (error) setAuthError(error.message);
+      else if (authMode === 'signup') setAuthError('Check your email to confirm your account!');
+    } catch {
+      setAuthError('An error occurred. Please try again.');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  // Sign out
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setUserTier('free');
+    setDailyUsage({ stories_started: 0, total_turns: 0 });
+    setGameState('input');
+    setWikiUrl('');
+    setStoryText('');
+    setChoices([]);
+    setConversationHistory([]);
+    setCurrentVibe('neutral');
+    setStoryMaxTurns(null);
+    setStoryCurrentTurn(0);
+  };
+
+  // Redirect to Stripe checkout
+  const handleUpgrade = async (plan) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/create-checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ plan })
+      });
+      const data = await res.json();
+      if (data.url) window.location.href = data.url;
+    } catch (err) {
+      console.error('Checkout error:', err);
+    }
+  };
+
+  // Redirect to Stripe customer portal
+  const handleManageSubscription = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/customer-portal`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${session.access_token}` }
+      });
+      const data = await res.json();
+      if (data.url) window.location.href = data.url;
+    } catch (err) {
+      console.error('Portal error:', err);
+    }
+  };
+
+  // Helper: stories limit for tier
+  const storiesLimit = userTier === 'paid' ? 6 : 3;
+  const storiesLeft = Math.max(0, storiesLimit - (dailyUsage.stories_started || 0));
+
   // Start the adventure
-const startAdventure = async () => {
+  const startAdventure = async () => {
     if (!wikiUrl.trim()) {
       setError('Please enter a Wikipedia URL');
       return;
@@ -235,29 +362,39 @@ const startAdventure = async () => {
       return;
     }
 
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) { setError('Please sign in to play.'); return; }
+
     setError('');
     setGameState('loading');
     setWikiTitle(title);
     setCurrentSaveId(Date.now().toString());
-    
+    setStoryCurrentTurn(0);
+
     try {
-      // 🚨 UPDATED: Calling YOUR backend instead of Anthropic
       const response = await fetch(`${API_BASE}/api/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: title })
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ title })
       });
+
+      if (response.status === 429) {
+        const data = await response.json();
+        setError(data.error || 'Daily limit reached. Upgrade to continue!');
+        setGameState('upgrade');
+        return;
+      }
 
       if (!response.ok) throw new Error('Failed to connect to game server');
 
       const data = await response.json();
-      const responseText = data.content;
-      
-      parseAndApplyResponse(responseText);
-      
+      setStoryMaxTurns(data.maxTurns ?? null);
+      setDailyUsage(prev => ({ ...prev, stories_started: (prev.stories_started || 0) + 1 }));
+
+      parseAndApplyResponse(data.content);
       setConversationHistory([
         { role: 'user', content: `Start adventure for: ${title}` },
-        { role: 'assistant', content: responseText }
+        { role: 'assistant', content: data.content }
       ]);
 
       setGameState('playing');
@@ -436,40 +573,52 @@ const startAdventure = async () => {
   };
 
   // Handle choice selection
-const handleChoice = async (choiceIndex) => {
+  const handleChoice = async (choiceIndex) => {
     const selectedChoice = choices[choiceIndex];
     setIsGenerating(true);
     setChoices([]);
     setStoryText(prev => prev + `\n\n→ ${selectedChoice}\n`);
 
+    const { data: { session } } = await supabase.auth.getSession();
+
     try {
-      // 🚨 UPDATED: Calling YOUR backend with the history
       const response = await fetch(`${API_BASE}/api/continue`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: session ? `Bearer ${session.access_token}` : ''
+        },
         body: JSON.stringify({
           title: wikiTitle,
-          selectedChoice: selectedChoice,
-          history: conversationHistory
+          selectedChoice,
+          history: conversationHistory,
+          storyMaxTurns
         })
       });
+
+      if (response.status === 429) {
+        const data = await response.json();
+        setError(data.error || 'Turn limit reached.');
+        setChoices([]);
+        return;
+      }
 
       if (!response.ok) throw new Error('Failed to continue story');
 
       const data = await response.json();
-      const responseText = data.content;
-      
-      parseAndApplyResponse(responseText);
-      
+      setStoryCurrentTurn(prev => prev + 1);
+      setDailyUsage(prev => ({ ...prev, total_turns: (prev.total_turns || 0) + 1 }));
+
+      parseAndApplyResponse(data.content);
       setConversationHistory([
         ...conversationHistory,
         { role: 'user', content: `Player chose: ${selectedChoice}` },
-        { role: 'assistant', content: responseText }
+        { role: 'assistant', content: data.content }
       ]);
     } catch (err) {
       console.error('Story continuation error:', err);
       setError('Failed to generate next part of the story.');
-      setChoices(['Try again', 'Go back', 'Start over']); 
+      setChoices(['Try again', 'Go back', 'Start over']);
     } finally {
       setIsGenerating(false);
     }
@@ -487,6 +636,8 @@ const handleChoice = async (choiceIndex) => {
     setCurrentVibe('neutral');
     setError('');
     setCurrentSaveId(null);
+    setStoryMaxTurns(null);
+    setStoryCurrentTurn(0);
   };
 
   return (
@@ -572,7 +723,66 @@ const handleChoice = async (choiceIndex) => {
                 </div>
               </div>
               
-              <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                {user && (
+                  <>
+                    {/* Tier badge */}
+                    <span style={{
+                      padding: '0.3rem 0.7rem',
+                      backgroundColor: userTier === 'paid' ? theme.accent : `${theme.accentLight}44`,
+                      color: userTier === 'paid' ? theme.bg : theme.accent,
+                      borderRadius: '20px',
+                      fontSize: '0.8rem',
+                      fontWeight: 700,
+                      border: `1px solid ${theme.accent}`,
+                      letterSpacing: '0.05em'
+                    }}>
+                      {userTier === 'paid' ? '★ PRO' : 'FREE'}
+                    </span>
+
+                    {/* Usage indicator */}
+                    <span style={{ fontSize: '0.82rem', opacity: 0.75 }}>
+                      {storiesLeft} {storiesLeft === 1 ? 'story' : 'stories'} left today
+                    </span>
+
+                    {userTier === 'paid' ? (
+                      <button
+                        onClick={handleManageSubscription}
+                        style={{
+                          backgroundColor: 'transparent',
+                          color: theme.accent,
+                          padding: '0.5rem 1rem',
+                          fontSize: '0.85rem',
+                          border: `1px solid ${theme.accent}`,
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                          fontWeight: 600
+                        }}
+                      >
+                        Manage Plan
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => setGameState('upgrade')}
+                        style={{
+                          backgroundColor: theme.accent,
+                          color: theme.bg,
+                          padding: '0.5rem 1rem',
+                          fontSize: '0.85rem',
+                          border: 'none',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          fontFamily: 'inherit',
+                          fontWeight: 700
+                        }}
+                      >
+                        Upgrade
+                      </button>
+                    )}
+                  </>
+                )}
+
                 <button
                   onClick={() => setGameState('saves')}
                   style={{
@@ -588,19 +798,15 @@ const handleChoice = async (choiceIndex) => {
                     transition: 'all 0.3s ease'
                   }}
                   onMouseEnter={(e) => {
-                    if (gameState !== 'saves') {
-                      e.target.style.backgroundColor = theme.accent + '22';
-                    }
+                    if (gameState !== 'saves') e.target.style.backgroundColor = theme.accent + '22';
                   }}
                   onMouseLeave={(e) => {
-                    if (gameState !== 'saves') {
-                      e.target.style.backgroundColor = 'transparent';
-                    }
+                    if (gameState !== 'saves') e.target.style.backgroundColor = 'transparent';
                   }}
                 >
                   📚 Saves ({saves.length})
                 </button>
-                
+
                 <button
                   onClick={() => setGameState('achievements')}
                   style={{
@@ -616,18 +822,33 @@ const handleChoice = async (choiceIndex) => {
                     transition: 'all 0.3s ease'
                   }}
                   onMouseEnter={(e) => {
-                    if (gameState !== 'achievements') {
-                      e.target.style.backgroundColor = theme.accent + '22';
-                    }
+                    if (gameState !== 'achievements') e.target.style.backgroundColor = theme.accent + '22';
                   }}
                   onMouseLeave={(e) => {
-                    if (gameState !== 'achievements') {
-                      e.target.style.backgroundColor = 'transparent';
-                    }
+                    if (gameState !== 'achievements') e.target.style.backgroundColor = 'transparent';
                   }}
                 >
                   🏆 Achievements ({achievements.length})
                 </button>
+
+                {user && (
+                  <button
+                    onClick={handleSignOut}
+                    style={{
+                      backgroundColor: 'transparent',
+                      color: theme.accent,
+                      padding: '0.6rem 1rem',
+                      fontSize: '0.85rem',
+                      border: `1px solid ${theme.accentLight}`,
+                      borderRadius: '6px',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                      opacity: 0.7
+                    }}
+                  >
+                    Sign Out
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -635,7 +856,217 @@ const handleChoice = async (choiceIndex) => {
 
         {/* Main content */}
         <main style={{ maxWidth: '900px', margin: '0 auto', padding: '2rem' }}>
-          {gameState === 'input' && (
+
+          {/* Session loading */}
+          {sessionLoading && (
+            <div style={{ textAlign: 'center', padding: '4rem 2rem' }}>
+              <RefreshCw size={40} color={theme.accent} style={{ animation: 'spin 1s linear infinite', marginBottom: '1rem' }} />
+              <p style={{ opacity: 0.7 }}>Loading...</p>
+            </div>
+          )}
+
+          {/* Auth screen */}
+          {!sessionLoading && !user && (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '2rem 0', animation: 'fadeIn 0.6s ease-out' }}>
+              <div style={{
+                width: '100%',
+                maxWidth: '420px',
+                backgroundColor: `${theme.accentLight}22`,
+                borderRadius: '12px',
+                border: `2px solid ${theme.accentLight}`,
+                padding: '2.5rem',
+                boxShadow: `0 8px 32px ${theme.shadow}`
+              }}>
+                <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
+                  <Sparkles size={40} color={theme.accent} style={{ marginBottom: '0.75rem' }} />
+                  <h2 style={{ margin: 0, fontSize: '1.6rem', fontWeight: 700 }}>
+                    {authMode === 'login' ? 'Welcome Back' : 'Create Account'}
+                  </h2>
+                  <p style={{ margin: '0.5rem 0 0 0', opacity: 0.65, fontSize: '0.95rem' }}>
+                    {authMode === 'login' ? 'Sign in to start your adventure' : 'Free to join — 3 stories per day'}
+                  </p>
+                </div>
+
+                <form onSubmit={handleAuth} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  <input
+                    type="email"
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    placeholder="Email address"
+                    required
+                    style={{
+                      padding: '0.85rem 1rem',
+                      fontSize: '1rem',
+                      border: `2px solid ${theme.accentLight}`,
+                      borderRadius: '8px',
+                      backgroundColor: theme.bg,
+                      color: theme.text,
+                      outline: 'none',
+                      fontFamily: 'inherit'
+                    }}
+                  />
+                  <input
+                    type="password"
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    placeholder="Password"
+                    required
+                    style={{
+                      padding: '0.85rem 1rem',
+                      fontSize: '1rem',
+                      border: `2px solid ${theme.accentLight}`,
+                      borderRadius: '8px',
+                      backgroundColor: theme.bg,
+                      color: theme.text,
+                      outline: 'none',
+                      fontFamily: 'inherit'
+                    }}
+                  />
+
+                  {authError && (
+                    <p style={{ color: authMode === 'signup' && authError.includes('Check') ? theme.accent : '#DC2626', fontSize: '0.9rem', margin: 0 }}>
+                      {authError}
+                    </p>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={authSubmitting}
+                    style={{
+                      backgroundColor: theme.accent,
+                      color: theme.bg,
+                      padding: '0.9rem',
+                      fontSize: '1rem',
+                      border: 'none',
+                      borderRadius: '8px',
+                      cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                      fontWeight: 700,
+                      fontFamily: 'inherit',
+                      opacity: authSubmitting ? 0.7 : 1,
+                      transition: 'all 0.2s ease'
+                    }}
+                  >
+                    {authSubmitting ? 'Please wait...' : authMode === 'login' ? 'Sign In' : 'Create Account'}
+                  </button>
+                </form>
+
+                <p style={{ textAlign: 'center', marginTop: '1.5rem', fontSize: '0.9rem', opacity: 0.7 }}>
+                  {authMode === 'login' ? "Don't have an account? " : 'Already have an account? '}
+                  <button
+                    onClick={() => { setAuthMode(authMode === 'login' ? 'signup' : 'login'); setAuthError(''); }}
+                    style={{ background: 'none', border: 'none', color: theme.accent, cursor: 'pointer', fontSize: '0.9rem', fontWeight: 600, padding: 0 }}
+                  >
+                    {authMode === 'login' ? 'Sign up free' : 'Sign in'}
+                  </button>
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Upgrade screen */}
+          {!sessionLoading && user && gameState === 'upgrade' && (
+            <div style={{ animation: 'fadeIn 0.6s ease-out' }}>
+              <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
+                <h2 style={{ fontSize: '2rem', fontWeight: 700, marginBottom: '0.5rem' }}>Unlock More Adventures</h2>
+                <p style={{ opacity: 0.7, fontSize: '1.05rem' }}>You've reached your daily free limit. Upgrade for more.</p>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '1.5rem', marginBottom: '2rem' }}>
+                {/* Monthly */}
+                <div style={{
+                  padding: '2rem',
+                  borderRadius: '12px',
+                  border: `2px solid ${theme.accentLight}`,
+                  backgroundColor: `${theme.accentLight}22`,
+                  textAlign: 'center'
+                }}>
+                  <div style={{ fontSize: '2.5rem', fontWeight: 700, color: theme.accent }}>£3</div>
+                  <div style={{ fontSize: '1rem', opacity: 0.7, marginBottom: '1.5rem' }}>per month</div>
+                  <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 1.5rem 0', textAlign: 'left' }}>
+                    {['6 stories per day', '25 turns per story', 'Sonnet AI model', 'Cancel anytime'].map(f => (
+                      <li key={f} style={{ padding: '0.3rem 0', fontSize: '0.95rem' }}>✓ {f}</li>
+                    ))}
+                  </ul>
+                  <button
+                    onClick={() => handleUpgrade('monthly')}
+                    style={{
+                      width: '100%',
+                      backgroundColor: theme.accent,
+                      color: theme.bg,
+                      padding: '0.9rem',
+                      fontSize: '1rem',
+                      border: 'none',
+                      borderRadius: '8px',
+                      cursor: 'pointer',
+                      fontWeight: 700,
+                      fontFamily: 'inherit'
+                    }}
+                  >
+                    Subscribe Monthly
+                  </button>
+                </div>
+                {/* Annual */}
+                <div style={{
+                  padding: '2rem',
+                  borderRadius: '12px',
+                  border: `2px solid ${theme.accent}`,
+                  backgroundColor: `${theme.accent}22`,
+                  textAlign: 'center',
+                  position: 'relative'
+                }}>
+                  <div style={{
+                    position: 'absolute', top: '-1px', right: '1.5rem',
+                    backgroundColor: theme.accent, color: theme.bg,
+                    padding: '0.25rem 0.75rem', borderRadius: '0 0 8px 8px',
+                    fontSize: '0.78rem', fontWeight: 700, letterSpacing: '0.05em'
+                  }}>
+                    BEST VALUE
+                  </div>
+                  <div style={{ fontSize: '2.5rem', fontWeight: 700, color: theme.accent }}>£30</div>
+                  <div style={{ fontSize: '1rem', opacity: 0.7, marginBottom: '1.5rem' }}>per year <span style={{ color: theme.accent, fontWeight: 600 }}>(save £6)</span></div>
+                  <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 1.5rem 0', textAlign: 'left' }}>
+                    {['6 stories per day', '25 turns per story', 'Sonnet AI model', 'Best value'].map(f => (
+                      <li key={f} style={{ padding: '0.3rem 0', fontSize: '0.95rem' }}>✓ {f}</li>
+                    ))}
+                  </ul>
+                  <button
+                    onClick={() => handleUpgrade('annual')}
+                    style={{
+                      width: '100%',
+                      backgroundColor: theme.accent,
+                      color: theme.bg,
+                      padding: '0.9rem',
+                      fontSize: '1rem',
+                      border: 'none',
+                      borderRadius: '8px',
+                      cursor: 'pointer',
+                      fontWeight: 700,
+                      fontFamily: 'inherit'
+                    }}
+                  >
+                    Subscribe Annually
+                  </button>
+                </div>
+              </div>
+              <div style={{ textAlign: 'center' }}>
+                <button
+                  onClick={() => setGameState('input')}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: theme.accent,
+                    cursor: 'pointer',
+                    fontSize: '0.95rem',
+                    opacity: 0.7,
+                    fontFamily: 'inherit'
+                  }}
+                >
+                  ← Back to Home
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!sessionLoading && user && gameState === 'input' && (
             <div
               style={{
                 animation: 'fadeIn 0.6s ease-out',
@@ -766,7 +1197,7 @@ const handleChoice = async (choiceIndex) => {
             </div>
           )}
 
-          {gameState === 'loading' && (
+          {!sessionLoading && user && gameState === 'loading' && (
             <div
               style={{
                 textAlign: 'center',
@@ -788,7 +1219,7 @@ const handleChoice = async (choiceIndex) => {
             </div>
           )}
 
-          {gameState === 'playing' && (
+          {!sessionLoading && user && gameState === 'playing' && (
             <div style={{ animation: 'fadeIn 0.6s ease-out' }}>
               {/* Wikipedia source */}
               <div
@@ -812,6 +1243,16 @@ const handleChoice = async (choiceIndex) => {
                   <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>
                     {wikiTitle}
                   </div>
+                  {storyMaxTurns && (
+                    <div style={{ fontSize: '0.82rem', opacity: 0.65, marginTop: '0.3rem' }}>
+                      Turn {storyCurrentTurn} of {storyMaxTurns}
+                      {storyMaxTurns - storyCurrentTurn <= 2 && storyCurrentTurn < storyMaxTurns && (
+                        <span style={{ color: '#DC2626', fontWeight: 600, marginLeft: '0.5rem' }}>
+                          — story must end soon!
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <button
                   onClick={resetGame}
@@ -978,7 +1419,7 @@ const handleChoice = async (choiceIndex) => {
             </div>
           )}
 
-          {gameState === 'saves' && (
+          {!sessionLoading && user && gameState === 'saves' && (
             <div style={{ animation: 'fadeIn 0.6s ease-out' }}>
               <h2 style={{ fontSize: '2rem', marginBottom: '1.5rem', fontWeight: 600 }}>
                 Your Adventures
@@ -1129,7 +1570,7 @@ const handleChoice = async (choiceIndex) => {
             </div>
           )}
 
-          {gameState === 'achievements' && (
+          {!sessionLoading && user && gameState === 'achievements' && (
             <div style={{ animation: 'fadeIn 0.6s ease-out' }}>
               <h2 style={{ fontSize: '2rem', marginBottom: '1.5rem', fontWeight: 600 }}>
                 Achievements
